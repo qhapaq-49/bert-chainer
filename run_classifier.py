@@ -25,12 +25,13 @@ import logging
 import os
 import modeling
 import optimization
-import tokenization
-import tensorflow as tf
+import tokenization_sentencepiece as tokenization
+#import tensorflow as tf
 
 from distutils.util import strtobool
 
 import chainer
+#chainer.set_debug(True)
 from chainer import functions as F
 from chainer import training
 from chainer.training import extensions
@@ -59,6 +60,7 @@ def get_arguments():
     parser.add_argument(
         '--vocab_file', required=True,
         help="The vocabulary file that the BERT model was trained on.")
+    parser.add_argument("--model_file", required=True, type=str, default=None)
     parser.add_argument(
         '--output_dir', required=True,
         help="The output directory where the model checkpoints will be written.")
@@ -243,6 +245,45 @@ class MrpcProcessor(DataProcessor):
         return examples
 
 
+class LivedoorProcessor(DataProcessor):
+  """Processor for the livedoor data set (see https://www.rondhuit.com/download.html)."""
+
+  def get_train_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+
+  def get_dev_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+  def get_test_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+
+  def get_labels(self):
+    """See base class."""
+    return ['dokujo-tsushin', 'it-life-hack', 'kaden-channel', 'livedoor-homme', 'movie-enter', 'peachy', 'smax', 'sports-watch', 'topic-news']
+
+
+  def _create_examples(self, lines, set_type):
+    """Creates examples for the training and dev sets."""
+    examples = []
+    for (i, line) in enumerate(lines):
+      if i == 0:
+        idx_text = line.index('text')
+        idx_label = line.index('label')
+      else:
+        guid = "%s-%s" % (set_type, i)
+        text_a = tokenization.convert_to_unicode(line[idx_text])
+        label = tokenization.convert_to_unicode(line[idx_label])
+        examples.append(
+            InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+    return examples
+
+
 class ColaProcessor(DataProcessor):
     """Processor for the CoLA data set (GLUE version)."""
 
@@ -423,6 +464,7 @@ def main():
         "cola": ColaProcessor,
         "mnli": MnliProcessor,
         "mrpc": MrpcProcessor,
+        "livedoor": LivedoorProcessor,
     }
 
     if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_print_test:
@@ -450,7 +492,7 @@ def main():
     label_list = processor.get_labels()
 
     tokenizer = tokenization.FullTokenizer(
-        vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+        model_file=FLAGS.model_file, vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
     train_examples = None
     num_train_steps = None
@@ -464,10 +506,11 @@ def main():
         num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
     bert = modeling.BertModel(config=bert_config)
-    model = modeling.BertClassifier(bert, num_labels=len(label_list))
+    pretrained = modeling.BertPretrainer(bert)
     chainer.serializers.load_npz(
-        FLAGS.init_checkpoint, model,
-        ignore_names=['output/W', 'output/b'])
+        FLAGS.init_checkpoint, pretrained)
+        
+    model = modeling.BertClassifier(pretrained.bert, num_labels=len(label_list))
 
     if FLAGS.gpu >= 0:
         chainer.backends.cuda.get_device_from_id(FLAGS.gpu).use()

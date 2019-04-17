@@ -24,9 +24,12 @@ import json
 import six
 
 import chainer
+from chainer import function_hooks
 from chainer import functions as F
 from chainer import links as L
-import numpy as np
+from chainer import initializers
+from chainer import variable
+import cupy as np
 
 
 class BertConfig(object):
@@ -188,6 +191,112 @@ class BertClassifier(chainer.Chain):
         return loss
 
 
+def gather_indexes(sequence_tensor, positions):
+    """Gathers the vectors at the specific positions over a minibatch."""
+    batch_size, seq_length, width = sequence_tensor.shape
+
+    flat_offsets = np.reshape(np.arange(0, batch_size, dtype=np.int32) * seq_length, [-1, 1])
+    flat_positions = np.reshape(positions + flat_offsets, [-1])
+    flat_sequence_tensor = np.reshape(sequence_tensor,
+                                      [batch_size * seq_length, width])
+    output_tensor = flat_sequence_tensor[[flat_positions]]
+    return output_tensor
+
+
+def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
+                         label_ids, label_weights):
+    """Get loss and log probs for the masked LM."""
+    input_tensor = gather_indexes(input_tensor, positions)
+    with tf.variable_scope("cls/predictions"):
+        # We apply one more non-linear transformation before the output layer.
+        # This matrix is not used after pre-training.
+        with tf.variable_scope("transform"):
+            input_tensor = tf.layers.dense(
+                input_tensor,
+                units=bert_config.hidden_size,
+                activation=modeling.get_activation(bert_config.hidden_act),
+                kernel_initializer=modeling.create_initializer(
+                    bert_config.initializer_range))
+            input_tensor = modeling.layer_norm(input_tensor)
+        # The output weights are the same as the input embeddings, but there is
+        # an output-only bias for each token.
+        output_bias = tf.get_variable(
+            "output_bias",
+            shape=[bert_config.vocab_size],
+            initializer=tf.zeros_initializer())
+        logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
+        logits = tf.nn.bias_add(logits, output_bias)
+        log_probs = tf.nn.log_softmax(logits, axis=-1)
+        label_ids = tf.reshape(label_ids, [-1])
+        label_weights = tf.reshape(label_weights, [-1])
+        one_hot_labels = tf.one_hot(
+            label_ids, depth=bert_config.vocab_size, dtype=tf.float32)
+        # The `positions` tensor might be zero-padded (if the sequence is too
+        # short to have the maximum number of predictions). The `label_weights`
+        # tensor has a value of 1.0 for every real prediction and 0.0 for the
+        # padding predictions.
+        per_example_loss = -tf.reduce_sum(log_probs * one_hot_labels, axis=[-1])
+        numerator = tf.reduce_sum(label_weights * per_example_loss)
+        denominator = tf.reduce_sum(label_weights) + 1e-5
+        loss = numerator / denominator
+        return (loss, per_example_loss, log_probs)
+
+
+class BertPretrainer(chainer.Chain):
+    def __init__(self, bert):
+        super(BertPretrainer, self).__init__()
+        with self.init_scope():
+            self.bert = bert
+            self.masked_lm_dense = L.Linear(None, self.bert.config.hidden_size,
+                                            initialW=initializers.Normal(scale=self.bert.config.initializer_range))
+            self.activate = get_activation('gelu')
+            self.mask_bias = variable.Parameter(initializers.Zero(), shape=self.bert.config.vocab_size)
+            self.next_sentence_weights = variable.Parameter(
+                initializers.Normal(scale=self.bert.config.initializer_range),
+                shape=(2, self.bert.config.hidden_size))
+            self.next_sentence_bias = variable.Parameter(initializers.Zero(), shape=2)
+            self.layer_norm = LayerNormalization3D(None)
+
+    def __call__(self, input_ids, input_mask, token_type_ids, masked_lm_positions, masked_lm_ids, masked_lm_weights,
+                 next_sentence_labels):
+        sequence_output, pooled_output = self.bert.get_sequence_output_and_pooled_output(
+            input_ids,
+            input_mask,
+            token_type_ids)
+        # parameterを直接取得してmatmulしてもbpされるか
+        embedding_table = self.bert.get_embedding_table()
+
+        """Gathers the vectors at the specific positions over a minibatch."""
+        batch_size, seq_length, width = sequence_output.shape
+        flat_offsets = np.reshape(np.arange(0, batch_size, dtype=np.int32) * seq_length, [-1, 1])
+        flat_positions = np.reshape(masked_lm_positions + flat_offsets, [-1])
+        flat_sequence_output = np.reshape(sequence_output,
+                                          [batch_size * seq_length, width])
+        x = flat_sequence_output[[flat_positions]]
+
+        """Get loss for the masked LM."""
+        normed = self.layer_norm(self.activate(self.masked_lm_dense(x)))
+        masked_lm_logits = F.matmul(normed, embedding_table.T) + self.mask_bias
+        label_ids = F.reshape(masked_lm_ids, [-1])
+        masked_lm_loss = F.softmax_cross_entropy(masked_lm_logits, label_ids, ignore_label=0)
+
+        chainer.report({'masked_lm_loss': masked_lm_loss}, self)
+        chainer.report({'masked_lm_accuracy': F.accuracy(masked_lm_logits, label_ids)}, self)
+
+        """Get loss for the next sentence."""
+        next_sentence_logits = F.matmul(pooled_output, self.next_sentence_weights.T) + self.next_sentence_bias
+        labels = F.reshape(next_sentence_labels, [-1])
+        next_sentence_loss = F.softmax_cross_entropy(next_sentence_logits, labels)
+
+        chainer.report({'next_sentence_loss': next_sentence_loss}, self)
+        chainer.report({'next_sentence_accuracy': F.accuracy(next_sentence_logits, labels)}, self)
+
+        loss = masked_lm_loss + next_sentence_loss
+        chainer.report({'loss': loss}, self)
+
+        return loss
+
+
 # For showing SQuAD accuracy with heuristics
 def check_answers(logits_var, labels_array, start_labels_array=None):
     if start_labels_array is not None:
@@ -260,6 +369,47 @@ class BertSQuAD(chainer.Chain):
         return predictions
 
 
+def embedding_lookup(input_ids,
+                     vocab_size,
+                     embedding_size=128,
+                     initializer_range=0.02,
+                     word_embedding_name="word_embeddings",
+                     use_one_hot_embeddings=False):
+    """Looks up words embeddings for id tensor.
+    Args:
+        input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
+          ids.
+        vocab_size: int. Size of the embedding vocabulary.
+        embedding_size: int. Width of the word embeddings.
+        initializer_range: float. Embedding initialization range.
+        word_embedding_name: string. Name of the embedding table.
+        use_one_hot_embeddings: bool. If True, use one-hot method for word
+          embeddings. If False, use `tf.nn.embedding_lookup()`. One hot is better
+          for TPUs.
+    Returns:
+        float Tensor of shape [batch_size, seq_length, embedding_size].
+    """
+    # This function assumes that the input is of shape [batch_size, seq_length,
+    # num_inputs].
+    #
+    # If the input is a 2D tensor of shape [batch_size, seq_length], we
+    # reshape to [batch_size, seq_length, 1].
+    if input_ids.shape.ndims == 2:
+        input_ids = tf.expand_dims(input_ids, axis=[-1])
+
+    embedding_table = tf.get_variable(
+        name=word_embedding_name,
+        shape=[vocab_size, embedding_size],
+        initializer=create_initializer(initializer_range))
+    output = tf.nn.embedding_lookup(embedding_table, input_ids)
+
+    input_shape = get_shape_list(input_ids)
+
+    output = tf.reshape(output,
+                        input_shape[0:-1] + [input_shape[-1] * embedding_size])
+    return (output, embedding_table)
+
+
 class BertModel(chainer.Chain):
     """BERT model ("Bidirectional Embedding Representations from a Transformer").
 
@@ -295,12 +445,13 @@ class BertModel(chainer.Chain):
             is invalid.
         """
         super(BertModel, self).__init__()
+        self.config = copy.deepcopy(config)
         config = copy.deepcopy(config)
         self.dropout_prob = config.hidden_dropout_prob
 
         with self.init_scope():
             self.word_embeddings = L.EmbedID(
-                config.vocab_size, config.hidden_size,
+                config.vocab_size, config.hidden_size, 
                 initialW=create_initializer(config.initializer_range))
             self.token_type_embeddings = L.EmbedID(
                 config.type_vocab_size, config.hidden_size,
@@ -328,8 +479,10 @@ class BertModel(chainer.Chain):
                  input_mask=None,
                  token_type_ids=None,
                  get_embedding_output=False,
+                 get_embedding_table=False,
                  get_all_encoder_layers=False,
-                 get_sequence_output=False):
+                 get_sequence_output=False,
+                 get_sequence_output_and_pooled_output=False):
         """Encode by BertModel.
 
         Args:
@@ -403,6 +556,8 @@ class BertModel(chainer.Chain):
         #    sequence_output[:, 0:1, :], axis=1)  # original
         first_token_tensor = sequence_output[:, 0]  # simplified
         pooled_output = F.tanh(self.pooler(first_token_tensor))
+        if get_sequence_output_and_pooled_output:
+            return sequence_output, pooled_output
         return pooled_output
 
     def get_pooled_output(self, input_ids, input_mask=None, token_type_ids=None):
@@ -419,6 +574,13 @@ class BertModel(chainer.Chain):
     def get_sequence_output(self, input_ids, input_mask=None, token_type_ids=None):
         return self.__call__(input_ids, input_mask, token_type_ids,
                              get_sequence_output=True)
+
+    def get_sequence_output_and_pooled_output(self, input_ids, input_mask=None, token_type_ids=None):
+        return self.__call__(input_ids, input_mask, token_type_ids,
+                             get_sequence_output_and_pooled_output=True)
+
+    def get_embedding_table(self):
+        return self.word_embeddings.W
 
 
 def gelu(input_tensor):
@@ -902,6 +1064,7 @@ class Transformer(chainer.Chain):
         self.intermediate_act_fn = intermediate_act_fn
 
         with self.init_scope():
+            print(num_hidden_layers)
             for layer_idx in range(self.num_hidden_layers):
                 layer_name = "layer_%d" % layer_idx
                 layer = TransformerLayer(
