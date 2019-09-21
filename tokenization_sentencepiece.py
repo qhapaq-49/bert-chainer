@@ -12,6 +12,7 @@ import re
 import unicodedata
 import sentencepiece as sp
 import six
+import sys
 #import tensorflow as tf
 
 
@@ -111,6 +112,7 @@ def printable_text(text):
 def load_vocab(vocab_file):
     """Loads a vocabulary file into a dictionary."""
     vocab = collections.OrderedDict()
+    inv_vocab = []
     index = 0
     with open(vocab_file, "r") as reader:
         while True:
@@ -120,8 +122,9 @@ def load_vocab(vocab_file):
             token, _ = token.split("\t")
             token = token.strip()
             vocab[token] = index
+            inv_vocab.append(token)
             index += 1
-    return vocab
+    return vocab, inv_vocab
 
 
 def convert_by_vocab(vocab, items, unk_info):
@@ -150,7 +153,7 @@ class FullTokenizer(object):
 
     def __init__(self, model_file, vocab_file, do_lower_case=True):
         self.tokenizer = SentencePieceTokenizer(model_file, do_lower_case=do_lower_case)
-        self.vocab = load_vocab(vocab_file)
+        self.vocab,_ = load_vocab(vocab_file)
         self.inv_vocab = {v: k for k, v in self.vocab.items()}
 
     def tokenize(self, text):
@@ -186,3 +189,8 @@ class SentencePieceTokenizer(object):
             text = text.lower()
         output_tokens = self.tokenizer.EncodeAsPieces(text)
         return output_tokens
+
+if __name__=='__main__':
+    tokenizer = FullTokenizer(sys.argv[2], sys.argv[3])
+    print(sys.argv[1])
+    print(tokenizer.tokenize(sys.argv[1]))
