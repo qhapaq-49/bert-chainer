@@ -600,7 +600,7 @@ class Converter(object):
         batch_input_mask = stack_and_to_gpu(all_input_mask, 'i')
         batch_input_segment_ids = stack_and_to_gpu(all_segment_ids, 'i')
         batch_input_masked_lm_positions = stack_and_to_gpu(all_masked_lm_positions, 'i')
-        batch_input_masked_lm_ids = stack_and_to_gpu(all_masked_lm_positions, 'i')
+        batch_input_masked_lm_ids = stack_and_to_gpu(all_masked_lm_ids, 'i')
         batch_input_masked_lm_weights = stack_and_to_gpu(all_masked_lm_weights, 'f')
         batch_input_next_sentence_labels = stack_and_to_gpu(all_next_sentence_labels, 'i')[:, 0]
         return (batch_input_ids, batch_input_mask,
